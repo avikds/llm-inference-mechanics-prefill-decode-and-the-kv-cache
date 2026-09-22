@@ -119,3 +119,108 @@ def rope_is_relative(cos, sin, head_dim, seed=0):
 
     return torch.allclose(dot_1, dot_2, atol=1e-4, rtol=0.0)
 
+# Step 3 - GQAAttention
+class GQAAttention(nn.Module):
+    def __init__(self, d, n_heads, n_kv_heads, max_len=2048):
+        super().__init__()
+
+        if d % n_heads != 0:
+            raise ValueError("d must be divisible by n_heads")
+        if n_heads % n_kv_heads != 0:
+            raise ValueError("n_heads must be divisible by n_kv_heads")
+
+        self.d = d
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.max_len = max_len
+
+        # Dimension of each attention head.
+        self.head_dim = d // n_heads
+
+        # Bias-free projections.
+        self.wq = nn.Linear(d, d, bias=False)
+        self.wk = nn.Linear(d, n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(d, n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(d, d, bias=False)
+
+        # Precompute rotary position embeddings and store them as buffers.
+        cos, sin = rope_cache(max_len, self.head_dim)
+        self.register_buffer("cos", cos)
+        self.register_buffer("sin", sin)
+
+    def forward(self, x, cache=None):
+        B, T, _ = x.shape
+
+        # Determine the number of cached/past tokens.
+        if cache is None:
+            S_past = 0
+            k_past = None
+            v_past = None
+        else:
+            k_past, v_past = cache
+            S_past = k_past.shape[2]
+
+        # Project queries, keys, and values.
+        q = self.wq(x)
+        k = self.wk(x)
+        v = self.wv(x)
+
+        # Reshape to:
+        # q -> (B, n_heads, T, head_dim)
+        # k,v -> (B, n_kv_heads, T, head_dim)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE using absolute sequence positions.
+        q = apply_rope(q, self.cos, self.sin, offset=S_past)
+        k = apply_rope(k, self.cos, self.sin, offset=S_past)
+
+        # Append the newly generated keys and values to the existing cache.
+        if cache is None:
+            k_all = k
+            v_all = v
+        else:
+            k_all = torch.cat([k_past, k], dim=2)
+            v_all = torch.cat([v_past, v], dim=2)
+
+        # Expand KV heads to the number of query heads.
+        # Each KV head is shared by an equal group of query heads.
+        repeat_factor = self.n_heads // self.n_kv_heads
+        k_attn = k_all.repeat_interleave(repeat_factor, dim=1)
+        v_attn = v_all.repeat_interleave(repeat_factor, dim=1)
+
+        # Scaled dot-product attention.
+        scores = torch.matmul(q, k_attn.transpose(-2, -1))
+        scores = scores / (self.head_dim ** 0.5)
+
+        # Causal mask using absolute positions.
+        # Query i corresponds to absolute position S_past + i,
+        # and may attend only to keys at positions <= that position.
+        S_total = S_past + T
+        q_positions = torch.arange(
+            S_past, S_total, device=x.device
+        )[:, None]
+        k_positions = torch.arange(
+            S_total, device=x.device
+        )[None, :]
+
+        causal_mask = k_positions <= q_positions
+
+        # Mask future positions before softmax.
+        scores = scores.masked_fill(~causal_mask, torch.finfo(scores.dtype).min)
+
+        attn = torch.softmax(scores, dim=-1)
+
+        # Weighted sum of values.
+        out = torch.matmul(attn, v_attn)
+
+        # Merge attention heads back into model dimension.
+        out = out.transpose(1, 2).contiguous().view(B, T, self.d)
+
+        # Final output projection.
+        out = self.wo(out)
+
+        # Return the un-expanded KV cache.
+        return out, (k_all, v_all)
+
