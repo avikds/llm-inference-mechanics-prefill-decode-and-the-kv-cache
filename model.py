@@ -655,3 +655,108 @@ def crossover_batch(
 
     return None
 
+# Step 9 - time_phases
+import time
+
+
+def time_call(fn, repeats=3):
+    # One untimed warm-up call.
+    fn()
+
+    times = []
+
+    for _ in range(repeats):
+        # CUDA operations are asynchronous, so synchronize when needed
+        # to measure actual wall-clock execution time.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        start = time.perf_counter()
+        fn()
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        times.append(time.perf_counter() - start)
+
+    return min(times)
+
+
+@torch.no_grad()
+def time_phases(model, prompt_len, n_new):
+    # Build the prompt exactly as specified.
+    vocab = model.cfg["vocab"]
+    prompt = torch.arange(
+        prompt_len,
+        dtype=torch.long,
+        device=next(model.parameters()).device,
+    ) % vocab
+
+    # Time the prefill phase.
+    prefill_s = time_call(
+        lambda: prefill(model, prompt)
+    )
+
+    # Build the cache once for the decode timing.
+    next_logits, cache = prefill(model, prompt)
+
+    # n_new is part of the interface; the requested measurement is
+    # the time for one decode step after the prefill.
+    del n_new
+
+    # Select the next token from the final prefill logits.
+    token = torch.argmax(next_logits).item()
+
+    # Time exactly one cached decode step.
+    decode_step_s = time_call(
+        lambda: decode_step(model, token, cache)
+    )
+
+    # Average prefill time per prompt token.
+    prefill_per_token_s = prefill_s / prompt_len
+
+    # Compare one decode step against one prefill token.
+    ratio = decode_step_s / prefill_per_token_s
+
+    return {
+        "prefill_s": round(prefill_s, 6),
+        "prefill_per_token_s": round(prefill_per_token_s, 6),
+        "decode_step_s": round(decode_step_s, 6),
+        "ratio": round(ratio, 6),
+    }
+
+
+@torch.no_grad()
+def time_decode_vs_batch(model, batches, context_len):
+    vocab = model.cfg["vocab"]
+    device = next(model.parameters()).device
+
+    results = {}
+
+    for batch in batches:
+        # Create a context and replicate it across the batch.
+        prompt = (
+            torch.arange(
+                context_len,
+                dtype=torch.long,
+                device=device,
+            )
+            % vocab
+        ).unsqueeze(0).repeat(batch, 1)
+
+        # Build the cache outside the timed decode operation.
+        logits, cache = model(prompt)
+
+        # One next token per sequence in the batch.
+        tokens = torch.argmax(logits[:, -1, :], dim=-1)
+
+        # Time one batched cached decode step.
+        def decode():
+            model(tokens.unsqueeze(1), cache=cache)
+
+        seconds = time_call(decode)
+
+        results[batch] = round(seconds, 6)
+
+    return results
+
