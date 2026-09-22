@@ -224,3 +224,95 @@ class GQAAttention(nn.Module):
         # Return the un-expanded KV cache.
         return out, (k_all, v_all)
 
+# Step 4 - TinyLM
+class TransformerBlock(nn.Module):
+    def __init__(self, d, n_heads, n_kv_heads, hidden, max_len):
+        super().__init__()
+
+        self.norm1 = RMSNorm(d)
+        self.attn = GQAAttention(d, n_heads, n_kv_heads, max_len)
+        self.norm2 = RMSNorm(d)
+        self.mlp = SwiGLU(d, hidden)
+
+    def forward(self, x, cache=None):
+        # Pre-norm attention followed by a residual connection.
+        attn_out, new_cache = self.attn(self.norm1(x), cache=cache)
+        x = x + attn_out
+
+        # Pre-norm SwiGLU MLP followed by a residual connection.
+        x = x + self.mlp(self.norm2(x))
+
+        return x, new_cache
+
+
+class TinyLM(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+
+        # Keep the original config object so that m.cfg is cfg.
+        self.cfg = cfg
+
+        # Token embedding.
+        self.tok = nn.Embedding(cfg["vocab"], cfg["d"])
+
+        # Transformer blocks.
+        self.blocks = nn.ModuleList([
+            TransformerBlock(
+                d=cfg["d"],
+                n_heads=cfg["n_heads"],
+                n_kv_heads=cfg["n_kv_heads"],
+                hidden=cfg["hidden"],
+                max_len=cfg["max_len"],
+            )
+            for _ in range(cfg["n_layers"])
+        ])
+
+        # Final normalization and vocabulary projection.
+        self.norm = RMSNorm(cfg["d"])
+        self.head = nn.Linear(cfg["d"], cfg["vocab"], bias=False)
+
+    def forward(self, idx, cache=None):
+        # Convert token IDs to embeddings.
+        x = self.tok(idx)
+
+        # Create an empty cache for every block on the first pass.
+        if cache is None:
+            cache = [None] * len(self.blocks)
+
+        new_cache = []
+
+        # Run each block with its corresponding cache.
+        for block, block_cache in zip(self.blocks, cache):
+            x, block_cache = block(x, cache=block_cache)
+            new_cache.append(block_cache)
+
+        # Final normalization and language-model head.
+        x = self.norm(x)
+        logits = self.head(x)
+
+        return logits, new_cache
+
+
+def make_cfg(
+    vocab=64,
+    d=64,
+    n_layers=2,
+    n_heads=4,
+    n_kv_heads=2,
+    hidden=None,
+    max_len=2048,
+):
+    # Default hidden size is four times the model width.
+    if hidden is None:
+        hidden = 4 * d
+
+    return {
+        "vocab": vocab,
+        "d": d,
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "n_kv_heads": n_kv_heads,
+        "hidden": hidden,
+        "max_len": max_len,
+    }
+

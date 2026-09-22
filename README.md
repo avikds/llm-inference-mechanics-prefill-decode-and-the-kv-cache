@@ -13,6 +13,7 @@ python scaffold.py
 - [x] **1.** RMSNorm
 - [x] **2.** rope_cache
 - [x] **3.** GQAAttention
+- [x] **4.** TinyLM
 
 ---
 
