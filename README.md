@@ -14,6 +14,7 @@ python scaffold.py
 - [x] **2.** rope_cache
 - [x] **3.** GQAAttention
 - [x] **4.** TinyLM
+- [x] **5.** prefill
 
 ---
 

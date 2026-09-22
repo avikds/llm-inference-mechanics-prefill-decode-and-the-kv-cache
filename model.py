@@ -316,3 +316,100 @@ def make_cfg(
         "max_len": max_len,
     }
 
+# Step 5 - prefill
+@torch.no_grad()
+def prefill(model, prompt):
+    # prompt is a 1-D tensor of token IDs; add a batch dimension.
+    if prompt.dim() != 1:
+        raise ValueError("prompt must be a 1-D tensor")
+
+    logits, cache = model(prompt.unsqueeze(0))
+
+    # Return only the logits corresponding to the final prompt token.
+    next_logits = logits[0, -1]
+
+    return next_logits, cache
+
+
+@torch.no_grad()
+def decode_step(model, token, cache):
+    # Find the model's device so the new token is placed consistently.
+    device = next(model.parameters()).device
+
+    # Feed exactly one token with batch and sequence dimensions.
+    token_tensor = torch.tensor(
+        [[token]],
+        dtype=torch.long,
+        device=device,
+    )
+
+    logits, new_cache = model(token_tensor, cache=cache)
+
+    # Remove batch and sequence dimensions.
+    next_logits = logits[0, -1]
+
+    return next_logits, new_cache
+
+
+@torch.no_grad()
+def generate(model, prompt, n, greedy=True, gen=None):
+    # Prefill the prompt once to construct the initial KV cache.
+    next_logits, cache = prefill(model, prompt)
+
+    tokens = []
+
+    for step in range(n):
+        if greedy:
+            # Greedy decoding selects the most probable token.
+            token = torch.argmax(next_logits).item()
+        else:
+            # Sample from the probability distribution.
+            probs = torch.softmax(next_logits, dim=-1)
+            token = torch.multinomial(
+                probs,
+                num_samples=1,
+                generator=gen,
+            ).item()
+
+        tokens.append(token)
+
+        # Do not feed the final sampled token back into the model.
+        # This keeps the number of model forward calls equal to n:
+        # one prefill call + (n - 1) decode calls would otherwise be
+        # needed for n generated tokens. Instead, the first generated
+        # token is obtained from prefill's logits, and only subsequent
+        # tokens require decode passes.
+        if step < n - 1:
+            next_logits, cache = decode_step(model, token, cache)
+
+    return tokens, n
+
+
+@torch.no_grad()
+def generate_recompute(model, prompt, n):
+    # Keep the complete growing sequence and recompute it from scratch
+    # at every generation step.
+    if prompt.dim() != 1:
+        raise ValueError("prompt must be a 1-D tensor")
+
+    device = next(model.parameters()).device
+    sequence = prompt.to(device)
+
+    tokens = []
+
+    for _ in range(n):
+        # Re-run the entire sequence without using a cache.
+        logits, _ = model(sequence.unsqueeze(0))
+
+        # Greedy next-token selection.
+        token = torch.argmax(logits[0, -1]).item()
+        tokens.append(token)
+
+        # Append the newly generated token to the sequence.
+        sequence = torch.cat([
+            sequence,
+            torch.tensor([token], dtype=torch.long, device=device),
+        ])
+
+    return tokens, n
+
