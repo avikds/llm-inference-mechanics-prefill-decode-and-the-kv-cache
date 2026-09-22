@@ -566,3 +566,92 @@ def decode_flops(cfg, context_len):
     # A decode step attends over the full existing context.
     return flops_per_token(cfg, context_len)
 
+# Step 8 - arithmetic_intensity
+def weight_bytes(cfg, bytes_per_elem):
+    return param_count(cfg) * bytes_per_elem
+
+
+def decode_bytes(cfg, batch, context_len, bytes_per_elem):
+    # Model weights are read once, the existing KV cache is read,
+    # and one new KV entry per sequence is written.
+    kv_per_token = kv_bytes_per_token(cfg, bytes_per_elem)
+
+    return (
+        weight_bytes(cfg, bytes_per_elem)
+        + batch * context_len * kv_per_token
+        + batch * kv_per_token
+    )
+
+
+def prefill_bytes(cfg, batch, n, bytes_per_elem):
+    # Model weights are read once, and the KV cache is written
+    # for all tokens in the prefill sequence.
+    return (
+        weight_bytes(cfg, bytes_per_elem)
+        + batch * n * kv_bytes_per_token(cfg, bytes_per_elem)
+    )
+
+
+def arithmetic_intensity(cfg, batch, context_len, bytes_per_elem, phase):
+    if phase == "decode":
+        flops = batch * decode_flops(cfg, context_len)
+        bytes_moved = decode_bytes(
+            cfg,
+            batch,
+            context_len,
+            bytes_per_elem,
+        )
+
+    elif phase == "prefill":
+        flops = batch * prefill_flops(cfg, context_len)
+        bytes_moved = prefill_bytes(
+            cfg,
+            batch,
+            context_len,
+            bytes_per_elem,
+        )
+
+    else:
+        raise ValueError("phase must be 'decode' or 'prefill'")
+
+    if bytes_moved == 0:
+        return 0.0
+
+    return round(flops / bytes_moved, 3)
+
+
+def bound(intensity, ops_per_byte):
+    # Below the hardware compute-to-memory ratio means
+    # memory bandwidth is the limiting factor.
+    if intensity < ops_per_byte:
+        return "memory"
+
+    return "compute"
+
+
+def crossover_batch(
+    cfg,
+    context_len,
+    bytes_per_elem,
+    ops_per_byte,
+    max_batch=4096,
+):
+    batch = 1
+
+    # Check powers of two: 1, 2, 4, 8, ...
+    while batch <= max_batch:
+        intensity = arithmetic_intensity(
+            cfg,
+            batch,
+            context_len,
+            bytes_per_elem,
+            "decode",
+        )
+
+        if intensity >= ops_per_byte:
+            return batch
+
+        batch *= 2
+
+    return None
+

@@ -17,6 +17,7 @@ python scaffold.py
 - [x] **5.** prefill
 - [x] **6.** kv_cache_bytes
 - [x] **7.** flops_per_token
+- [x] **8.** arithmetic_intensity
 
 ---
 
