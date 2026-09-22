@@ -16,6 +16,7 @@ python scaffold.py
 - [x] **4.** TinyLM
 - [x] **5.** prefill
 - [x] **6.** kv_cache_bytes
+- [x] **7.** flops_per_token
 
 ---
 

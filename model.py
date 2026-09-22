@@ -475,3 +475,94 @@ def cache_growth(model, prompt, n):
 
     return growth
 
+# Step 7 - flops_per_token
+def param_count(cfg):
+    d = cfg["d"]
+    vocab = cfg["vocab"]
+    n_layers = cfg["n_layers"]
+    n_heads = cfg["n_heads"]
+    n_kv_heads = cfg["n_kv_heads"]
+    hidden = cfg["hidden"]
+
+    head_dim = d // n_heads
+
+    # Token embedding.
+    embedding_params = vocab * d
+
+    # Parameters in one Transformer block:
+    # wq + wo
+    attention_qo = 2 * d * d
+
+    # wk + wv
+    attention_kv = 2 * d * n_kv_heads * head_dim
+
+    # w1 + w3 + w2 in SwiGLU
+    mlp = 3 * d * hidden
+
+    # norm1 + norm2
+    block_norms = 2 * d
+
+    per_block = attention_qo + attention_kv + mlp + block_norms
+
+    # Final RMSNorm and vocabulary projection head.
+    final_norm = d
+    head = d * vocab
+
+    return (
+        embedding_params
+        + n_layers * per_block
+        + final_norm
+        + head
+    )
+
+
+def matmul_params(cfg):
+    d = cfg["d"]
+    vocab = cfg["vocab"]
+    n_layers = cfg["n_layers"]
+    n_heads = cfg["n_heads"]
+    n_kv_heads = cfg["n_kv_heads"]
+    hidden = cfg["hidden"]
+
+    head_dim = d // n_heads
+
+    # All weights that participate in matrix multiplications:
+    # attention projections + SwiGLU projections + LM head.
+    per_block = (
+        2 * d * d
+        + 2 * d * n_kv_heads * head_dim
+        + 3 * d * hidden
+    )
+
+    head = d * vocab
+
+    return n_layers * per_block + head
+
+
+def flops_per_token(cfg, context_len):
+    d = cfg["d"]
+    n_layers = cfg["n_layers"]
+
+    # Projection/MLP matrix multiplications account for
+    # 2 FLOPs per parameter (multiply + add).
+    matmul_flops = 2 * matmul_params(cfg)
+
+    # Attention score and value multiplications.
+    attention_flops = 4 * n_layers * d * context_len
+
+    return matmul_flops + attention_flops
+
+
+def prefill_flops(cfg, n):
+    # During prefill, token position t attends over t positions.
+    # Therefore sum the per-token FLOPs for context lengths 1..n.
+    return sum(
+        flops_per_token(cfg, context_len)
+        for context_len in range(1, n + 1)
+    )
+
+
+def decode_flops(cfg, context_len):
+    # A decode step attends over the full existing context.
+    return flops_per_token(cfg, context_len)
+
