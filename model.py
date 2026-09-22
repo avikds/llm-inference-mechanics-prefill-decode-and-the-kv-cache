@@ -413,3 +413,65 @@ def generate_recompute(model, prompt, n):
 
     return tokens, n
 
+# Step 6 - kv_cache_bytes
+def kv_bytes_per_token(cfg, bytes_per_elem):
+    # Each token stores one key and one value for every layer.
+    head_dim = cfg["d"] // cfg["n_heads"]
+
+    return (
+        2
+        * cfg["n_layers"]
+        * cfg["n_kv_heads"]
+        * head_dim
+        * bytes_per_elem
+    )
+
+
+def kv_cache_bytes(cfg, seq_len, batch, bytes_per_elem):
+    return (
+        batch
+        * seq_len
+        * kv_bytes_per_token(cfg, bytes_per_elem)
+    )
+
+
+def measured_cache_bytes(cache):
+    total_bytes = 0
+
+    # Sum the storage used by every key and value tensor.
+    for k, v in cache:
+        total_bytes += k.numel() * k.element_size()
+        total_bytes += v.numel() * v.element_size()
+
+    return total_bytes
+
+
+def max_context(cfg, memory_bytes, batch, bytes_per_elem, weight_bytes):
+    # Memory remaining after accounting for model weights.
+    available_bytes = max(0, memory_bytes - weight_bytes)
+
+    bytes_per_token = kv_bytes_per_token(cfg, bytes_per_elem)
+
+    if bytes_per_token <= 0 or batch <= 0:
+        return 0
+
+    # Explicitly convert to int because inputs such as 80e9
+    # and 16e9 are floating-point values.
+    return int(
+        available_bytes // (batch * bytes_per_token)
+    )
+
+
+def cache_growth(model, prompt, n):
+    # Prefill the prompt and measure the initial cache.
+    next_logits, cache = prefill(model, prompt)
+    growth = [measured_cache_bytes(cache)]
+
+    # Generate n additional tokens using cached decoding.
+    for _ in range(n):
+        token = torch.argmax(next_logits).item()
+        next_logits, cache = decode_step(model, token, cache)
+        growth.append(measured_cache_bytes(cache))
+
+    return growth
+

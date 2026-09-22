@@ -15,6 +15,7 @@ python scaffold.py
 - [x] **3.** GQAAttention
 - [x] **4.** TinyLM
 - [x] **5.** prefill
+- [x] **6.** kv_cache_bytes
 
 ---
 
