@@ -841,3 +841,102 @@ def context_where_attention_dominates(cfg):
         matmul_params(cfg) / (2 * n_layers * d)
     )
 
+# Step 11 - kv_sharing_report
+def kv_variants(cfg):
+    # Create independent configurations for MHA, GQA, and MQA.
+    mha_cfg = dict(cfg)
+    mha_cfg["n_kv_heads"] = cfg["n_heads"]
+
+    gqa_cfg = dict(cfg)
+    gqa_cfg["n_kv_heads"] = cfg["n_kv_heads"]
+
+    mqa_cfg = dict(cfg)
+    mqa_cfg["n_kv_heads"] = 1
+
+    return {
+        "mha": mha_cfg,
+        "gqa": gqa_cfg,
+        "mqa": mqa_cfg,
+    }
+
+
+def kv_sharing_report(cfg, seq_len, batch, bytes_per_elem):
+    variants = kv_variants(cfg)
+
+    report = []
+
+    # First compute the MHA cache size so the savings of GQA and MQA
+    # can be measured relative to it.
+    mha_cfg = variants["mha"]
+    mha_cache_bytes = kv_cache_bytes(
+        mha_cfg,
+        seq_len,
+        batch,
+        bytes_per_elem,
+    )
+
+    head_dim = cfg["d"] // cfg["n_heads"]
+
+    for name in ("mha", "gqa", "mqa"):
+        variant_cfg = variants[name]
+        n_kv_heads = variant_cfg["n_kv_heads"]
+
+        kv_per_token = kv_bytes_per_token(
+            variant_cfg,
+            bytes_per_elem,
+        )
+
+        cache_bytes = kv_cache_bytes(
+            variant_cfg,
+            seq_len,
+            batch,
+            bytes_per_elem,
+        )
+
+        # Attention projection parameters in a single layer:
+        # wq + wo + wk + wv.
+        attn_params_per_layer = (
+            2 * cfg["d"] * cfg["d"]
+            + 2 * cfg["d"] * n_kv_heads * head_dim
+        )
+
+        saving_vs_mha = 1 - cache_bytes / mha_cache_bytes
+
+        report.append({
+            "name": name,
+            "n_kv_heads": n_kv_heads,
+            "kv_bytes_per_token": kv_per_token,
+            "cache_bytes": cache_bytes,
+            "attn_params_per_layer": attn_params_per_layer,
+            "saving_vs_mha": round(saving_vs_mha, 4),
+        })
+
+    return report
+
+
+def mha_equals_gqa_with_all_heads(seed=0):
+    torch.manual_seed(seed)
+
+    # MHA: one KV head for every query head.
+    mha = GQAAttention(32, 4, 4)
+
+    # GQA: two KV heads shared across four query heads.
+    gqa = GQAAttention(32, 4, 2)
+
+    head_dim = 32 // 4
+
+    # Copy the first two KV heads from the MHA projections into GQA.
+    rows = 2 * head_dim
+
+    with torch.no_grad():
+        gqa.wk.weight.copy_(mha.wk.weight[:rows])
+        gqa.wv.weight.copy_(mha.wv.weight[:rows])
+
+    # Use the same input for both attention modules.
+    x = torch.randn(1, 5, 32)
+
+    mha_out, _ = mha(x)
+    gqa_out, _ = gqa(x)
+
+    return torch.allclose(mha_out, gqa_out)
+
