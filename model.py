@@ -760,3 +760,84 @@ def time_decode_vs_batch(model, batches, context_len):
 
     return results
 
+# Step 10 - attention_cost_vs_length
+import math
+
+def attention_fraction(cfg, context_len):
+    d = cfg["d"]
+    n_layers = cfg["n_layers"]
+
+    # Attention FLOPs for one token attending over context_len positions.
+    attention_flops = 4 * n_layers * d * context_len
+
+    # Total FLOPs for one token at this context length.
+    total_flops = flops_per_token(cfg, context_len)
+
+    if total_flops == 0:
+        return 0.0
+
+    return round(attention_flops / total_flops, 4)
+
+
+@torch.no_grad()
+def attention_cost_vs_length(model, lengths):
+    vocab = model.cfg["vocab"]
+    device = next(model.parameters()).device
+
+    results = {}
+
+    for length in lengths:
+        # Build a single prompt of the requested length.
+        prompt = (
+            torch.arange(
+                length,
+                dtype=torch.long,
+                device=device,
+            ) % vocab
+        ).unsqueeze(0)
+
+        # Time one complete forward pass over the prompt.
+        seconds = time_call(
+            lambda prompt=prompt: model(prompt)
+        )
+
+        results[length] = round(seconds, 6)
+
+    return results
+
+
+def growth_exponent(times):
+    # Use the smallest and largest context lengths.
+    lengths = sorted(times)
+
+    n_min = lengths[0]
+    n_max = lengths[-1]
+    t_min = times[n_min]
+    t_max = times[n_max]
+
+    # Log-log slope:
+    # log(t_max / t_min) / log(n_max / n_min)
+    if n_max == n_min:
+        return 0.0
+
+    return round(
+        math.log(t_max / t_min) / math.log(n_max / n_min),
+        3,
+    )
+
+
+def context_where_attention_dominates(cfg):
+    d = cfg["d"]
+    n_layers = cfg["n_layers"]
+
+    # Attention reaches at least half of total FLOPs when:
+    #
+    # 4 * L * d * context >= matmul_params
+    #
+    # which gives:
+    #
+    # context >= matmul_params / (2 * L * d)
+    return math.ceil(
+        matmul_params(cfg) / (2 * n_layers * d)
+    )
+
