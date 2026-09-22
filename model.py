@@ -940,3 +940,128 @@ def mha_equals_gqa_with_all_heads(seed=0):
 
     return torch.allclose(mha_out, gqa_out)
 
+# Step 12 - inference_report
+def roofline_time(flops, bytes_moved, hw):
+    # Roofline model: execution time is limited by either
+    # compute throughput or memory bandwidth.
+    return max(
+        flops / hw["peak_flops"],
+        bytes_moved / hw["bandwidth"],
+    )
+
+
+def inference_report(cfg, hw, prompt_len, batch):
+    # Basic model statistics.
+    params = param_count(cfg)
+
+    weight_bytes_total = weight_bytes(
+        cfg,
+        hw["bytes_per_elem"],
+    )
+
+    weight_gb = weight_bytes_total / 1e9
+
+    kv_kb_per_token = (
+        kv_bytes_per_token(
+            cfg,
+            hw["bytes_per_elem"],
+        ) / 1024
+    )
+
+    # Maximum context for batch size 1 after reserving memory
+    # for the model weights.
+    max_context_batch1 = max_context(
+        cfg,
+        hw["memory_bytes"],
+        1,
+        hw["bytes_per_elem"],
+        weight_bytes_total,
+    )
+
+    # Memory-bandwidth floor for decoding the model weights.
+    decode_floor_ms = (
+        weight_bytes_total / hw["bandwidth"]
+    ) * 1000
+
+    # Time to first token: roofline estimate for prefill.
+    prefill_flops_total = (
+        batch * prefill_flops(cfg, prompt_len)
+    )
+    prefill_bytes_total = prefill_bytes(
+        cfg,
+        batch,
+        prompt_len,
+        hw["bytes_per_elem"],
+    )
+
+    ttft_ms = roofline_time(
+        prefill_flops_total,
+        prefill_bytes_total,
+        hw,
+    ) * 1000
+
+    # Inter-token latency: roofline estimate for one cached
+    # decode step at the requested batch size and context length.
+    decode_flops_total = (
+        batch * decode_flops(cfg, prompt_len)
+    )
+    decode_bytes_total = decode_bytes(
+        cfg,
+        batch,
+        prompt_len,
+        hw["bytes_per_elem"],
+    )
+
+    itl_ms = roofline_time(
+        decode_flops_total,
+        decode_bytes_total,
+        hw,
+    ) * 1000
+
+    # Decode arithmetic intensity and hardware bound.
+    decode_intensity = arithmetic_intensity(
+        cfg,
+        batch,
+        prompt_len,
+        hw["bytes_per_elem"],
+        "decode",
+    )
+
+    ops_per_byte = hw["peak_flops"] / hw["bandwidth"]
+
+    decode_bound = bound(
+        decode_intensity,
+        ops_per_byte,
+    )
+
+    # Smallest power-of-two batch whose decode intensity
+    # reaches the hardware compute-to-bandwidth ratio.
+    crossover = crossover_batch(
+        cfg,
+        prompt_len,
+        hw["bytes_per_elem"],
+        ops_per_byte,
+    )
+
+    # Preserve the exact required key order.
+    return {
+        "params": params,
+        "weight_gb": round(weight_gb, 3),
+        "kv_kb_per_token": round(kv_kb_per_token, 3),
+        "max_context_batch1": max_context_batch1,
+        "decode_floor_ms": round(decode_floor_ms, 3),
+        "ttft_ms": round(ttft_ms, 3),
+        "itl_ms": round(itl_ms, 3),
+        "decode_intensity": round(decode_intensity, 3),
+        "decode_bound": decode_bound,
+        "crossover_batch": crossover,
+    }
+
+
+def format_report(rep):
+    # One line per report entry, preserving dictionary order.
+    return [
+        f"{key:20s} {value}"
+        for key, value in rep.items()
+    ]
+

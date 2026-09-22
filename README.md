@@ -21,6 +21,7 @@ python scaffold.py
 - [x] **9.** time_phases
 - [x] **10.** attention_cost_vs_length
 - [x] **11.** kv_sharing_report
+- [x] **12.** inference_report
 
 ---
 
